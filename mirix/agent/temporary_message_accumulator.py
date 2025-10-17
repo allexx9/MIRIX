@@ -1,10 +1,14 @@
 import copy
+import itertools
 import logging
 import os
+import queue
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta
+from typing import Any, Callable, Dict, Optional
 
 from tqdm import tqdm
 
@@ -16,6 +20,175 @@ from mirix.agent.app_constants import (
 from mirix.agent.app_utils import encode_image
 from mirix.constants import CHAINING_FOR_MEMORY_UPDATE
 from mirix.voice_utils import convert_base64_to_audio_segment, process_voice_files
+
+
+# Memorizing task management -------------------------------------------------
+
+_memorizing_logger = logging.getLogger("Mirix.MemorizingWorker")
+_memorizing_logger.setLevel(logging.INFO)
+
+_MEMORIZING_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="mirix-memorizing"
+)
+_MEMORIZING_TASK_QUEUE: "queue.PriorityQueue[tuple[int, int, MemorizingJob]]"  # type: ignore[name-defined]
+_MEMORIZING_TASK_QUEUE = queue.PriorityQueue()
+_MEMORIZING_TASK_COUNTER = itertools.count()
+_MEMORIZING_JOBS: Dict[str, "MemorizingJob"] = {}
+_MEMORIZING_JOBS_LOCK = threading.Lock()
+_MEMORIZING_WORKER_THREAD: Optional[threading.Thread] = None
+_MEMORIZING_WORKER_LOCK = threading.Lock()
+
+
+class MemorizingJob:
+    """Represents a queued memorizing task."""
+
+    def __init__(
+        self,
+        accumulator: "TemporaryMessageAccumulator",
+        agent_states,
+        ready_messages,
+        user_id: Optional[str],
+        on_complete: Optional[Callable[[], None]] = None,
+        force: bool = False,
+    ) -> None:
+        self.job_id = str(uuid.uuid4())
+        self.accumulator = accumulator
+        self.agent_states = agent_states
+        self.ready_messages = ready_messages
+        self.user_id = user_id
+        self.on_complete = on_complete
+        self.force = force
+        self.future: Optional[Future] = None
+        self.event = threading.Event()
+        self.status = "queued"
+        self.error: Optional[str] = None
+        self.created_at = datetime.utcnow()
+        self.started_at: Optional[datetime] = None
+        self.completed_at: Optional[datetime] = None
+        self.ready_message_count: Optional[int] = (
+            len(ready_messages) if ready_messages is not None else None
+        )
+
+    def to_dict(self) -> Dict[str, Optional[Any]]:
+        return {
+            "job_id": self.job_id,
+            "status": self.status,
+            "error": self.error,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat()
+            if self.completed_at
+            else None,
+            "ready_message_count": self.ready_message_count,
+            "force": self.force,
+        }
+
+
+def _handle_job_completion(job: MemorizingJob, future: Future) -> None:
+    try:
+        future.result()
+    except Exception as exc:  # pragma: no cover - defensive logging
+        job.status = "failed"
+        job.error = str(exc)
+        _memorizing_logger.exception(
+            "Error while processing memorizing job %s", job.job_id
+        )
+    else:
+        job.status = "completed"
+        job.error = None
+    finally:
+        job.completed_at = datetime.utcnow()
+        job.event.set()
+        _MEMORIZING_TASK_QUEUE.task_done()
+
+
+def _run_job(job: MemorizingJob) -> None:
+    job.accumulator.absorb_content_into_memory(
+        job.agent_states, ready_messages=job.ready_messages, user_id=job.user_id
+    )
+    if job.on_complete is not None:
+        try:
+            job.on_complete()
+        except Exception as callback_error:  # pragma: no cover - defensive logging
+            _memorizing_logger.exception(
+                "Error executing completion callback for job %s: %s",
+                job.job_id,
+                callback_error,
+            )
+
+
+def _memorizing_worker_loop() -> None:
+    while True:
+        try:
+            _, _, job = _MEMORIZING_TASK_QUEUE.get(timeout=1.0)
+        except queue.Empty:
+            continue
+
+        job.started_at = datetime.utcnow()
+        job.status = "in_progress"
+
+        try:
+            future = _MEMORIZING_EXECUTOR.submit(_run_job, job)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            job.status = "failed"
+            job.error = str(exc)
+            job.completed_at = datetime.utcnow()
+            job.event.set()
+            _memorizing_logger.exception(
+                "Failed to submit memorizing job %s: %s", job.job_id, exc
+            )
+            _MEMORIZING_TASK_QUEUE.task_done()
+            continue
+
+        job.future = future
+        future.add_done_callback(
+            lambda fut, current_job=job: _handle_job_completion(current_job, fut)
+        )
+
+
+def _ensure_memorizing_worker_started() -> None:
+    global _MEMORIZING_WORKER_THREAD
+    if _MEMORIZING_WORKER_THREAD and _MEMORIZING_WORKER_THREAD.is_alive():
+        return
+
+    with _MEMORIZING_WORKER_LOCK:
+        if _MEMORIZING_WORKER_THREAD and _MEMORIZING_WORKER_THREAD.is_alive():
+            return
+
+        _MEMORIZING_WORKER_THREAD = threading.Thread(
+            target=_memorizing_worker_loop,
+            name="mirix-memorizing-worker",
+            daemon=True,
+        )
+        _MEMORIZING_WORKER_THREAD.start()
+
+
+def _enqueue_memorizing_job(job: MemorizingJob) -> MemorizingJob:
+    with _MEMORIZING_JOBS_LOCK:
+        _MEMORIZING_JOBS[job.job_id] = job
+
+    priority = 0 if job.force else 1
+    sequence = next(_MEMORIZING_TASK_COUNTER)
+    _MEMORIZING_TASK_QUEUE.put((priority, sequence, job))
+    return job
+
+
+def get_memorizing_job_status(job_id: str) -> Optional[Dict[str, Optional[Any]]]:
+    with _MEMORIZING_JOBS_LOCK:
+        job = _MEMORIZING_JOBS.get(job_id)
+        if job is None:
+            return None
+        return job.to_dict()
+
+
+def wait_for_memorizing_job(job_id: str, timeout: Optional[float] = None) -> bool:
+    with _MEMORIZING_JOBS_LOCK:
+        job = _MEMORIZING_JOBS.get(job_id)
+
+    if job is None:
+        return False
+
+    return job.event.wait(timeout)
 
 
 def get_image_mime_type(image_path):
@@ -61,6 +234,8 @@ class TemporaryMessageAccumulator:
             f"Mirix.TemporaryMessageAccumulator.{model_name}"
         )
         self.logger.setLevel(logging.INFO)
+
+        _ensure_memorizing_worker_started()
 
         # Determine if this model needs file uploads
         self.needs_upload = model_name in GEMINI_MODELS
@@ -198,6 +373,34 @@ class TemporaryMessageAccumulator:
                 {"role": "assistant", "content": assistant_response},
             ]
         )
+
+    # Memorizing task orchestration -------------------------------------------------
+
+    def enqueue_absorption_task(
+        self,
+        agent_states,
+        ready_messages=None,
+        user_id: Optional[str] = None,
+        on_complete: Optional[Callable[[], None]] = None,
+        force: bool = False,
+    ) -> MemorizingJob:
+        job = MemorizingJob(
+            accumulator=self,
+            agent_states=agent_states,
+            ready_messages=ready_messages,
+            user_id=user_id,
+            on_complete=on_complete,
+            force=force,
+        )
+        return _enqueue_memorizing_job(job)
+
+    @staticmethod
+    def get_memorizing_job_status(job_id: str) -> Optional[Dict[str, Optional[Any]]]:
+        return get_memorizing_job_status(job_id)
+
+    @staticmethod
+    def wait_for_job(job_id: str, timeout: Optional[float] = None) -> bool:
+        return wait_for_memorizing_job(job_id, timeout=timeout)
 
     def should_absorb_content(self):
         """Check if content should be absorbed into memory and return ready messages."""
