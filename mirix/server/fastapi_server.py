@@ -9,12 +9,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from ..agent.agent_wrapper import AgentWrapper
+from ..agent.temporary_message_accumulator import get_memorizing_job_status
 from ..functions.mcp_client import StdioServerConfig, get_mcp_client_manager
 from ..services.mcp_marketplace import get_mcp_marketplace
 from ..services.mcp_tool_registry import get_mcp_tool_registry
@@ -344,6 +345,7 @@ class MessageRequest(BaseModel):
 class MessageResponse(BaseModel):
     response: str
     status: str = "success"
+    job_id: Optional[str] = None
 
 
 class ConfirmationRequest(BaseModel):
@@ -591,6 +593,17 @@ async def startup_event():
     print("Agent initialized successfully")
 
 
+class MemorizingJobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    error: Optional[str] = None
+    created_at: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    ready_message_count: Optional[int] = None
+    force: Optional[bool] = None
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint for monitoring server status"""
@@ -599,6 +612,14 @@ async def health_check():
         "agent_initialized": agent is not None,
         "timestamp": datetime.now().isoformat(),
     }
+
+
+@app.get("/memorizing_status/{job_id}", response_model=MemorizingJobStatusResponse)
+async def memorizing_status(job_id: str):
+    job_status = get_memorizing_job_status(job_id)
+    if job_status is None:
+        raise HTTPException(status_code=404, detail="Memorizing job not found")
+    return job_status
 
 
 @app.post("/send_message")
@@ -654,13 +675,22 @@ async def send_message_endpoint(request: MessageRequest):
             raise HTTPException(status_code=500, detail="Agent returned an error")
 
         # Handle case where agent returns None
+        if request.memorizing:
+            if isinstance(response, dict) and response.get("job_id"):
+                return JSONResponse(
+                    status_code=status.HTTP_202_ACCEPTED,
+                    content=MessageResponse(
+                        response="",
+                        status=response.get("status", "accepted"),
+                        job_id=response.get("job_id"),
+                    ).dict(),
+                )
+
+            # When memorizing=True, None response is expected (no response needed)
+            return MessageResponse(response="", status="accumulating")
+
         if response is None:
-            if request.memorizing:
-                # When memorizing=True, None response is expected (no response needed)
-                response = ""
-            else:
-                # When memorizing=False, None response is an error
-                response = "I received your message but couldn't generate a response. Please try again."
+            response = "I received your message but couldn't generate a response. Please try again."
 
         return MessageResponse(response=response)
 

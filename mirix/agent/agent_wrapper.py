@@ -1993,22 +1993,27 @@ Please perform this analysis and create new memories as appropriate. Provide a d
             # Check if we should trigger memory absorption
             ready_messages = self.temp_message_accumulator.should_absorb_content()
             if force_absorb_content or ready_messages:
-                t1 = time.time()
-                # Pass the ready messages to absorb_content_into_memory if availabl, user_id=user_ide
-                if ready_messages:
-                    self.temp_message_accumulator.absorb_content_into_memory(
-                        self.agent_states, ready_messages, user_id=user_id
-                    )
-                else:
-                    # Force absorb with whatever is available
-                    self.temp_message_accumulator.absorb_content_into_memory(
-                        self.agent_states, user_id=user_id
-                    )
-                t2 = time.time()
-                self.logger.info(
-                    f"Time taken to absorb content into memory: {t2 - t1} seconds"
+                job = self.temp_message_accumulator.enqueue_absorption_task(
+                    agent_states=self.agent_states,
+                    ready_messages=ready_messages or None,
+                    user_id=user_id,
+                    on_complete=self.clear_old_screenshots,
+                    force=force_absorb_content,
                 )
-                self.clear_old_screenshots()
+
+                if force_absorb_content:
+                    self.logger.info(
+                        "Waiting for memorizing job %s to complete", job.job_id
+                    )
+                    self.temp_message_accumulator.wait_for_job(job.job_id)
+                    return (
+                        self.temp_message_accumulator.get_memorizing_job_status(
+                            job.job_id
+                        )
+                        or {"job_id": job.job_id, "status": "unknown"}
+                    )
+
+                return {"job_id": job.job_id, "status": "queued"}
 
         else:
             if image_uris is not None:
